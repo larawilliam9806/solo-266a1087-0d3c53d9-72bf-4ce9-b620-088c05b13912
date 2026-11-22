@@ -1,0 +1,15 @@
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE: /data/app.db
+      # 生产环境请换成随机长字符串
+      SECRET_KEY: change-me-in-production
+    volumes:
+      - blind_data:/data
+    restart: unless-stopped
+
+volumes:
+  blind_data:

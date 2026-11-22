@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}场次 {{ sess.name }}{% endblock %}
+{% block content %}
+<h1>场次：{{ sess.name }}</h1>
+
+<table>
+  <tr>
+    <th>备样录入</th>
+    <td>{% if stats.sample_count %}已录入 {{ stats.sample_count }} 个盲码{% else %}未录入{% endif %}</td>
+  </tr>
+  <tr>
+    <th>评分录入</th>
+    <td>{% if stats.score_count %}已录入 {{ stats.score_count }} 条评分（覆盖 {{ stats.score_codes }} 个盲码）{% else %}未录入{% endif %}</td>
+  </tr>
+  <tr>
+    <th>两表盲码</th>
+    <td>
+      {% if stats.sample_count and stats.score_count %}
+        {% if stats.codes_match %}一致，可以封存{% else %}不一致，请修正后重新上传{% endif %}
+      {% else %}—{% endif %}
+    </td>
+  </tr>
+  <tr>
+    <th>封存状态</th>
+    <td>{% if sess.sealed_at %}已封存（{{ sess.sealed_at }}），两表已固定{% else %}未封存{% endif %}</td>
+  </tr>
+  <tr>
+    <th>揭盲状态</th>
+    <td>
+      {% if sess.publication_id %}
+        已揭盲，<a href="{{ url_for('publication_detail', publication_id=sess.publication_id) }}">查看已发布结果</a>
+      {% else %}未揭盲{% endif %}
+    </td>
+  </tr>
+</table>
+
+{% if not sess.sealed_at %}
+<fieldset>
+  <legend>上传备样 CSV（列：盲码,配方；保存后整份替换本场现有备样）</legend>
+  <form method="post" action="{{ url_for('upload_samples', session_id=sess.id) }}" enctype="multipart/form-data">
+    <input type="file" name="file" accept=".csv" required>
+    <button type="submit">保存备样</button>
+  </form>
+</fieldset>
+
+<fieldset>
+  <legend>上传评分 CSV（列：盲码,评委号,分数；保存后整份替换本场现有评分）</legend>
+  <form method="post" action="{{ url_for('upload_scores', session_id=sess.id) }}" enctype="multipart/form-data">
+    <input type="file" name="file" accept=".csv" required>
+    <button type="submit">保存评分</button>
+  </form>
+</fieldset>
+
+<form method="post" action="{{ url_for('seal_session', session_id=sess.id) }}">
+  <button type="submit">封存本场（封存后两表固定，不可再改）</button>
+</form>
+{% endif %}
+
+{% if sess.sealed_at and not sess.publication_id %}
+<form method="post" action="{{ url_for('unblind_session', session_id=sess.id) }}">
+  <button type="submit">揭盲（按共用盲码把直接/间接相连的场次整组发布）</button>
+</form>
+{% endif %}
+{% endblock %}

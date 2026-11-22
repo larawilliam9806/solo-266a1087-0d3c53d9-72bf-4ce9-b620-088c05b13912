@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}揭盲 #{{ pub.id }}{% endblock %}
+{% block content %}
+<h1>揭盲 #{{ pub.id }}</h1>
+<p>发布时间：{{ pub.created_at }}</p>
+
+<h2>同组场次</h2>
+<ul>
+  {% for s in sessions %}<li>{{ s.name }}</li>{% endfor %}
+</ul>
+
+<h2>盲码对应配方</h2>
+<table>
+  <tr><th>盲码</th><th>配方</th></tr>
+  {% for c in codes %}
+  <tr><td>{{ c.code }}</td><td>{{ c.recipe }}</td></tr>
+  {% endfor %}
+</table>
+
+<h2>各场配方均分</h2>
+<table>
+  <tr><th>场次</th><th>配方</th><th>均分</th><th>评分数</th></tr>
+  {% for a in averages %}
+  <tr>
+    <td>{{ a.session_name }}</td>
+    <td>{{ a.recipe }}</td>
+    <td>{{ "%.3f"|format(a.avg_score) }}</td>
+    <td>{{ a.score_count }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}

@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>盲评场次</h1>
+
+<form method="post" action="{{ url_for('create_session') }}">
+  <input type="text" name="name" placeholder="新场次名称" required>
+  <button type="submit">新建场次</button>
+</form>
+
+<table>
+  <tr>
+    <th>场次</th><th>备样录入</th><th>评分录入</th><th>封存状态</th><th>揭盲状态</th><th></th>
+  </tr>
+  {% for s in sessions %}
+  <tr>
+    <td>{{ s.name }}</td>
+    <td>
+      {% if s.sample_count %}<span class="badge ok">已录入 {{ s.sample_count }} 个盲码</span>
+      {% else %}<span class="badge warn">未录入</span>{% endif %}
+    </td>
+    <td>
+      {% if s.score_count %}<span class="badge ok">已录入 {{ s.score_count }} 条</span>
+      {% else %}<span class="badge warn">未录入</span>{% endif %}
+    </td>
+    <td>
+      {% if s.sealed_at %}<span class="badge done">已封存</span>
+      {% else %}<span class="badge warn">未封存</span>{% endif %}
+    </td>
+    <td>
+      {% if s.publication_id %}
+        <a href="{{ url_for('publication_detail', publication_id=s.publication_id) }}">已揭盲</a>
+      {% else %}未揭盲{% endif %}
+    </td>
+    <td><a href="{{ url_for('session_detail', session_id=s.id) }}">管理</a></td>
+  </tr>
+  {% endfor %}
+</table>
+
+{% if publications %}
+<h2>已发布的揭盲</h2>
+<ul>
+  {% for p in publications %}
+  <li><a href="{{ url_for('publication_detail', publication_id=p.id) }}">揭盲 #{{ p.id }}</a>（{{ p.created_at }}）</li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% endblock %}
