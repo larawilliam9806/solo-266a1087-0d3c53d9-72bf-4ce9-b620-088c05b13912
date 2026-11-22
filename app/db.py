@@ -4,6 +4,7 @@
 BEGIN IMMEDIATE / COMMIT / ROLLBACK 显式控制，保证多步写入的原子性。
 """
 import sqlite3
+import time
 
 from flask import current_app, g
 
@@ -87,15 +88,26 @@ def close_db(_exc=None):
         db.close()
 
 
-def init_db(db_path):
-    conn = connect(db_path)
-    try:
-        # WAL：读不阻塞写、写不阻塞读，配合短写事务，
-        # 让不相连场次的保存不必等揭盲汇总结束。
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.executescript(SCHEMA)
-    finally:
-        conn.close()
+def init_db(db_path, retries=50, delay=0.1):
+    """建库建表。gunicorn 多 worker 同时启动时，切换 WAL 会短暂互斥，
+    因此对 database is locked/busy 做有限重试，避免启动即失败。"""
+    last_error = None
+    for _ in range(retries):
+        conn = connect(db_path)
+        try:
+            # WAL：读不阻塞写、写不阻塞读，配合短写事务，
+            # 让不相连场次的保存不必等揭盲汇总结束。
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.executescript(SCHEMA)
+            return
+        except sqlite3.OperationalError as exc:
+            last_error = exc
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            time.sleep(delay)
+        finally:
+            conn.close()
+    raise last_error
 
 
 def init_app(app):

@@ -32,6 +32,11 @@ def create_app(test_config=None):
     db_module.init_db(app.config["DATABASE"])
     db_module.init_app(app)
 
+    @app.get("/healthz")
+    def healthz():
+        db_module.get_db().execute("SELECT 1").fetchone()
+        return "ok", 200
+
     @app.route("/")
     def index():
         db = db_module.get_db()

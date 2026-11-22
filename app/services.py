@@ -3,14 +3,22 @@
 关键约束：
 - 同一盲码（跨所有场次）只能对应一种配方；
 - 两表都有数据且盲码集合一致才可封存，封存后两表固定；
-- 揭盲按"共用盲码直接或间接相连"分组，组内有未封存场次则列出并拒绝；
-- 发布以实际发布时（写事务内）的场次关系和封存状态为准，失败整组不发布；
-- 后续备样含已揭盲的码整份退回。
+- 揭盲沿备样、评分两表里的盲码，找齐与发起场次直接或间接相连的场次；
+- 能否发布、未封存名单和配方均分都取自同一份已提交数据；
+- 汇总在只读事务中完成，发布只占一个短写事务；写事务内重新取同一份
+  快照核对，关联或封存状态有变化就按新快照重来一轮；
+- 关联反复变化、多轮都无法完成判定时，提示重新发起；
+- 失败时不留下本次发布记录。
 """
 import csv
 import io
 import math
 import sqlite3
+from typing import NamedTuple
+
+# 汇总/核对最多进行的轮数。每轮只在只读事务中汇总，再用短写事务核对；
+# 若期间关联或封存状态变化，就按最新快照重来。超过轮数则提示重新发起。
+MAX_UNBLIND_ROUNDS = 3
 
 
 class BizError(Exception):
@@ -296,7 +304,7 @@ def _published(db, group):
 
 
 def _unsealed_error(unsealed):
-    names = "、".join(f"「{r['name']}」" for r in unsealed)
+    names = "、".join(f"「{name}」" for _, name in unsealed)
     return BizError(f"同组还有未封存场次：{names}，本次揭盲被拒绝")
 
 
@@ -324,69 +332,140 @@ def compute_results(db, group):
     return code_recipe, averages
 
 
+class _Plan(NamedTuple):
+    """一次判定所依据的完整事实，全部取自同一份已提交数据。
+
+    只包含与本次揭盲分组有关的内容，因此不相连场次的保存不会改变它。
+    """
+
+    group: tuple            # 同组场次 id，升序
+    unsealed: tuple         # 组内未封存场次 (id, name)
+    published: tuple        # 组内已揭盲场次 (id, name)
+    code_recipe: tuple      # (code, recipe)，按 code 升序
+    averages: tuple         # (session_id, recipe, avg_score, score_count)
+
+
+def _build_plan(db, session_id):
+    """在当前连接当前快照下，把分组、封存状态与汇总一次算齐。"""
+    group = compute_group(db, session_id)
+    unsealed = tuple((r["id"], r["name"]) for r in _unsealed(db, group))
+    published = tuple((r["id"], r["name"]) for r in _published(db, group))
+    if unsealed or published:
+        # 反正不会发布，先报封存/重复揭盲问题，不必再算均分。
+        code_recipe, averages = {}, []
+    else:
+        code_recipe, averages = compute_results(db, group)
+    return _Plan(
+        group=tuple(sorted(group)),
+        unsealed=unsealed,
+        published=published,
+        code_recipe=tuple(sorted(code_recipe.items())),
+        averages=tuple(
+            (r["session_id"], r["recipe"], r["avg_score"], r["score_count"])
+            for r in averages
+        ),
+    )
+
+
+def _rollback_quietly(db):
+    try:
+        db.execute("ROLLBACK")
+    except sqlite3.Error:
+        pass
+
+
+def _read_plan(db, session_id):
+    """只读事务内取一份前后一致的快照，不持有写锁。"""
+    db.execute("BEGIN")
+    try:
+        plan = _build_plan(db, session_id)
+        db.execute("COMMIT")
+        return plan
+    except Exception:
+        _rollback_quietly(db)
+        raise
+
+
+def _ensure_publishable(plan, session_id):
+    if session_id in {sid for sid, _ in plan.published}:
+        raise BizError("该场已揭盲，不能重复揭盲")
+    if plan.unsealed:
+        raise _unsealed_error(plan.unsealed)
+    if plan.published:
+        raise BizError("该场所在组包含已揭盲场次，不能重复揭盲")
+
+
+def _insert_publication(db, plan):
+    cur = db.execute("INSERT INTO publications (created_at) VALUES (datetime('now'))")
+    pub_id = cur.lastrowid
+    db.executemany(
+        "INSERT INTO publication_sessions (publication_id, session_id) VALUES (?, ?)",
+        [(pub_id, sid) for sid in plan.group],
+    )
+    db.executemany(
+        "INSERT INTO published_codes (publication_id, code, recipe) VALUES (?, ?, ?)",
+        [(pub_id, code, recipe) for code, recipe in plan.code_recipe],
+    )
+    db.executemany(
+        """INSERT INTO published_averages
+           (publication_id, session_id, recipe, avg_score, score_count)
+           VALUES (?, ?, ?, ?, ?)""",
+        [(pub_id, *row) for row in plan.averages],
+    )
+    marks = ",".join("?" for _ in plan.group)
+    db.execute(
+        f"UPDATE sessions SET publication_id = ? WHERE id IN ({marks})",
+        (pub_id, *plan.group),
+    )
+    return pub_id
+
+
 def unblind(db, session_id):
     """揭盲：整组发布盲码对应配方和各场配方均分。
 
-    分两阶段：
-    1. 只读阶段完成分组与汇总计算，不持有写锁 —— 不相连场次的保存无需等待；
-    2. 短写事务内重新核对场次关系和封存状态（以实际发布时为准），
-       全部满足才写入发布结果；任何失败回滚，整组结果都不发布。
+    1. 只读事务中汇总：沿备样、评分两表里的盲码找出与发起场次直接或
+       间接相连的场次，计算未封存名单、已揭盲场次和配方均分。只读快照
+       不持有写锁，不相连场次在此期间仍可保存备样/评分。
+    2. 短写事务内重新取同一份数据并核对：只有与只读汇总完全一致才据此
+       作出发布判定并写入。不一致说明期间关联或封存状态有变化，回滚后
+       按新的已提交数据重来（新连入的已封存场次也会被纳入汇总）。
+       这样能否发布、未封存名单和配方均分都来自作出最终判定的那份数据。
+    3. 关联反复变化、多轮仍无法稳定判定时，提示重新发起；任何失败都
+       回滚，不留下本次发布记录。
     """
     sess = get_session(db, session_id)
     if sess["publication_id"] is not None:
         raise BizError("该场已揭盲，不能重复揭盲")
 
-    # 阶段一：只读预检与汇总
-    group = compute_group(db, session_id)
-    unsealed = _unsealed(db, group)
-    if unsealed:
-        raise _unsealed_error(unsealed)
-    if _published(db, group):
-        raise BizError("该场所在组包含已揭盲场次，不能重复揭盲")
-    code_recipe, averages = compute_results(db, group)
+    for _ in range(MAX_UNBLIND_ROUNDS):
+        planned = _read_plan(db, session_id)
 
-    # 阶段二：写事务内以当前状态为准重新核对并发布
-    db.execute("BEGIN IMMEDIATE")
-    try:
-        group_now = compute_group(db, session_id)
-        unsealed_now = _unsealed(db, group_now)
-        if unsealed_now:
-            raise _unsealed_error(unsealed_now)
-        if _published(db, group_now):
-            raise BizError("该场所在组包含已揭盲场次，不能重复揭盲")
-        if group_now != group:
-            group = group_now
-            code_recipe, averages = compute_results(db, group)
+        try:
+            db.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                raise BizError("数据库正忙，请稍后重新发起揭盲") from exc
+            raise
+        try:
+            current = _build_plan(db, session_id)
+        except Exception:
+            _rollback_quietly(db)
+            raise
+        if current != planned:
+            # 期间关联或封存状态有变化：以最新已提交数据重新汇总。
+            _rollback_quietly(db)
+            continue
 
-        cur = db.execute("INSERT INTO publications (created_at) VALUES (datetime('now'))")
-        pub_id = cur.lastrowid
-        db.executemany(
-            "INSERT INTO publication_sessions (publication_id, session_id) VALUES (?, ?)",
-            [(pub_id, sid) for sid in sorted(group)],
-        )
-        db.executemany(
-            "INSERT INTO published_codes (publication_id, code, recipe) VALUES (?, ?, ?)",
-            [(pub_id, code, recipe) for code, recipe in sorted(code_recipe.items())],
-        )
-        db.executemany(
-            """INSERT INTO published_averages
-               (publication_id, session_id, recipe, avg_score, score_count)
-               VALUES (?, ?, ?, ?, ?)""",
-            [
-                (pub_id, r["session_id"], r["recipe"], r["avg_score"], r["score_count"])
-                for r in averages
-            ],
-        )
-        marks = ",".join("?" for _ in group)
-        db.execute(
-            f"UPDATE sessions SET publication_id = ? WHERE id IN ({marks})",
-            (pub_id, *sorted(group)),
-        )
-        db.execute("COMMIT")
-        return pub_id
-    except Exception:
-        db.execute("ROLLBACK")
-        raise
+        try:
+            _ensure_publishable(current, session_id)
+            pub_id = _insert_publication(db, current)
+            db.execute("COMMIT")
+            return pub_id
+        except Exception:
+            _rollback_quietly(db)
+            raise
+
+    raise BizError("场次关联或封存状态在汇总期间反复变化，本次无法完成判定，请重新发起揭盲")
 
 
 def get_publication(db, publication_id):
